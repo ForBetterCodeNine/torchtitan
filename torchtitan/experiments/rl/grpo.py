@@ -22,6 +22,7 @@ python3 torchtitan/experiments/rl/grpo.py \
 """
 
 import asyncio
+import dataclasses
 import logging
 import math
 import os
@@ -215,6 +216,13 @@ class RLTrainer(Configurable):
         """VLLMGenerator actor configuration (vLLM engine, sampling)."""
 
         def __post_init__(self):
+            if self.generator.checkpoint.enable:
+                raise ValueError(
+                    "Generator checkpoint must be disabled in the RL loop "
+                    "(weights are synced from the trainer via TorchStore). "
+                    "Set generator.checkpoint.enable=False."
+                )
+
             if self.trainer.debug.batch_invariant:
                 if not self.trainer.debug.deterministic:
                     raise ValueError("batch_invariant requires deterministic=True")
@@ -432,11 +440,17 @@ class RLTrainer(Configurable):
         await setup_torch_elastic_env_async(trainer_mesh)
         await setup_torch_elastic_env_async(generator_mesh)
 
+        # Wire RLTrainer dump_folder into PolicyTrainer so CheckpointManager
+        # saves/loads from the correct directory.
+        trainer_config = dataclasses.replace(
+            config.trainer, dump_folder=config.dump_folder
+        )
+
         # Spawn actors on their respective meshes
         self.trainer = trainer_mesh.spawn(
             "trainer",
             PolicyTrainer,
-            config.trainer,
+            trainer_config,
             model_spec=config.model_spec,
             hf_assets_path=config.hf_assets_path,
             generator_dtype=config.generator.model_dtype,
