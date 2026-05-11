@@ -10,8 +10,13 @@ import math
 from dataclasses import dataclass, fields
 
 import torch
+import torch._dynamo.config
 from torch import nn
 from torch.nn import init
+
+# TP async collectives produce varying tensor types that trigger dynamo
+# recompilation. Increase the limit so guards stabilize after initial steps.
+torch._dynamo.config.cache_size_limit = 64
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -21,6 +26,27 @@ from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import ModuleDict
 from torchtitan.tools.logging import logger
+
+
+def _flex_torchtitan_attention_forward(
+    module, query, key, value, attention_mask, **kwargs
+):
+    """FlexAttention forward that is compile-friendly.
+
+    HF's flex_attention_forward passes return_lse=True which triggers a
+    deprecated warnings.warn in PyTorch's flex_attention, breaking dynamo.
+    This avoids that by not requesting LSE.
+    """
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+    scaling = kwargs.get("scaling")
+
+    block_mask = attention_mask if isinstance(attention_mask, BlockMask) else None
+
+    out = flex_attention(
+        query, key, value, block_mask=block_mask, scale=scaling, enable_gqa=True
+    )
+    return out, None
 
 
 class SliceableModuleDict(ModuleDict):
@@ -177,10 +203,11 @@ class HFTransformerModel(BaseModel):
             """Configure HuggingFace attention settings."""
             self._titan_injected_model_args["attn_implementation"] = attn_implementation
             self.attn_implementation = attn_implementation
-            # Only register custom implementations that HF doesn't already
-            # know about (e.g. "sdpa_torchtitan"). Standard implementations
-            # like "flex_attention" are already registered by HF.
-            if attn_implementation not in AttentionInterface._global_mapping:
+            if attn_implementation == "flex_torchtitan":
+                AttentionInterface._global_mapping[
+                    attn_implementation
+                ] = _flex_torchtitan_attention_forward
+            elif attn_implementation not in AttentionInterface._global_mapping:
                 AttentionInterface._global_mapping[
                     attn_implementation
                 ] = sdpa_attention_forward
@@ -261,6 +288,9 @@ class HFTransformerModel(BaseModel):
             self.mlp_bias = False
             self.use_cache = False
             self.initializer_range = 1.0  # use as std for normal init in embedding
+            # FlexAttention does not support dropout
+            if hasattr(self, "attention_dropout"):
+                self.attention_dropout = 0.0
 
             # Recalculate intermediate_size only when model dimensions are
             # explicitly overridden (debugmodel). When using the HF config's
@@ -278,6 +308,8 @@ class HFTransformerModel(BaseModel):
                 )
 
             if self._titan_injected_model_args.get("dim") is not None:
+                self.head_dim = self.dim // self.num_attention_heads
+            elif not hasattr(self, "head_dim"):
                 self.head_dim = self.dim // self.num_attention_heads
 
             return self

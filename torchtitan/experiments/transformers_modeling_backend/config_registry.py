@@ -22,6 +22,7 @@ from torchtitan.hf_datasets.text_datasets import ChatDataLoader, HuggingFaceText
 from torchtitan.tools.profiler import Profiler
 
 from . import model_registry
+from .tokenizer import HFBackendTokenizer
 
 
 def transformers_modeling_backend_debugmodel() -> TransformersBackendConfig:
@@ -103,6 +104,7 @@ def transformers_modeling_backend_sft_full() -> TransformersBackendConfig:
         hf_assets_path="./tests/assets/qwen3_0.6b",
         hf_model="Qwen/Qwen3-0.6B",
         model_spec=model_registry("sft_full"),
+        tokenizer=HFBackendTokenizer.Config(),
         optimizer=OptimizersContainer.Config(lr=2e-5),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
@@ -151,6 +153,7 @@ def transformers_modeling_backend_sft_debugmodel() -> TransformersBackendConfig:
         hf_assets_path="./tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
         model_spec=model_registry("sft_debugmodel"),
+        tokenizer=HFBackendTokenizer.Config(),
         optimizer=OptimizersContainer.Config(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
