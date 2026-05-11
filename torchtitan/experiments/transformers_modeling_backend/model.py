@@ -177,10 +177,13 @@ class HFTransformerModel(BaseModel):
             """Configure HuggingFace attention settings."""
             self._titan_injected_model_args["attn_implementation"] = attn_implementation
             self.attn_implementation = attn_implementation
-            # NOTE:(3outeille):This will force create_causal_mask to return None
-            AttentionInterface._global_mapping[
-                attn_implementation
-            ] = sdpa_attention_forward
+            # Only register custom implementations that HF doesn't already
+            # know about (e.g. "sdpa_torchtitan"). Standard implementations
+            # like "flex_attention" are already registered by HF.
+            if attn_implementation not in AttentionInterface._global_mapping:
+                AttentionInterface._global_mapping[
+                    attn_implementation
+                ] = sdpa_attention_forward
 
         def _create_getter_setter_dynamically(self, has_moe: bool):
             """

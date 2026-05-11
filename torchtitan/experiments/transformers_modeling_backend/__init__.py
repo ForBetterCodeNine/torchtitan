@@ -58,6 +58,7 @@ flavors = {
             n_kv_heads=16,
             attn_mask_type="block_causal",
         ),
+        attn_implementation="flex_attention",
     ),
     "full": HFTransformerModel.Config(
         titan_dense_config=TitanDenseModelConfig(),
@@ -66,6 +67,7 @@ flavors = {
         titan_dense_config=TitanDenseModelConfig(
             attn_mask_type="block_causal",
         ),
+        attn_implementation="flex_attention",
     ),
 }
 
