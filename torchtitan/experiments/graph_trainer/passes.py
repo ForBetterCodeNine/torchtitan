@@ -31,6 +31,11 @@ from collections.abc import Callable
 import torch
 from torch._logging import trace_structured
 
+from torchtitan.experiments.graph_trainer.chunk_passes import (
+    chunk_batch_pass,
+    chunk_seq_pass,
+    import_chunk_dim_metadata_pass,
+)
 from torchtitan.experiments.graph_trainer.cpu_offload import apply_cpu_offload_pass
 from torchtitan.experiments.graph_trainer.cudagraph import (
     cudagraph_pass,
@@ -154,6 +159,7 @@ def compile_time_passes(
     from torchtitan.models.common.attention import FlexAttention
 
     n_layers = len(config.model_spec.model.layers)
+    module_bucket_plans = get_default_transformer_block_buckets(n_layers)
     passes: list[Callable] = [
         remove_detach_pass,
         remove_identity_view_pass,
@@ -168,13 +174,43 @@ def compile_time_passes(
             prefetch_lookahead=config.compile.cpu_offload_prefetch_n_layers,
             defer_n_layers=config.compile.cpu_offload_defer_n_layers,
         ),
-        selective_activation_remat_pass,
-        overlap_fsdp_ag_rs_pass,
-        functools.partial(
-            joint_transformer_block_bucketing_reordering_pass,
-            module_bucket_plans=get_default_transformer_block_buckets(n_layers),
-        ),
     ]
+    if config.compile.chunk_modules:
+        chunk_mode = config.compile.chunk_mode
+        if chunk_mode not in ("batch", "seq"):
+            raise ValueError(
+                "--compile.chunk_mode must be 'batch' or 'seq' when "
+                "--compile.chunk_modules is non-empty"
+            )
+        chunk_pass = chunk_batch_pass if chunk_mode == "batch" else chunk_seq_pass
+        passes.extend(
+            [
+                functools.partial(
+                    import_chunk_dim_metadata_pass,
+                    mode=chunk_mode,
+                ),
+                functools.partial(
+                    chunk_pass,
+                    module_patterns=config.compile.chunk_modules,
+                    num_static_inputs=traced_result.num_static_inputs,
+                    module_bucket_plans=module_bucket_plans,
+                ),
+            ]
+        )
+    elif config.compile.chunk_mode is not None:
+        raise ValueError(
+            "--compile.chunk_modules must be non-empty when --compile.chunk_mode is set"
+        )
+    passes.extend(
+        [
+            selective_activation_remat_pass,
+            overlap_fsdp_ag_rs_pass,
+            functools.partial(
+                joint_transformer_block_bucketing_reordering_pass,
+                module_bucket_plans=module_bucket_plans,
+            ),
+        ]
+    )
     if config.parallelism.enable_async_tensor_parallel:
         passes.append(async_tensor_parallel_pass)
 

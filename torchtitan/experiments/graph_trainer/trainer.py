@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,6 +12,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 from torch.fx.traceback import annotate_fn
+
+from torchtitan.experiments.graph_trainer.chunk_passes import prepare_chunk_trace_inputs
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _MODULE_FQN,
@@ -167,7 +170,13 @@ class GraphTrainer(Trainer):
             else:
                 fwd_bwd_fn = make_fwd_bwd_step(self.loss_fn)
                 with self.train_context(), log_timer("trace_train_step"):
-                    self._traced_step = trace_train_step(fwd_bwd_fn)(
+                    self._traced_step = trace_train_step(
+                        fwd_bwd_fn,
+                        prepare_inputs=functools.partial(
+                            prepare_chunk_trace_inputs,
+                            self.config.compile,
+                        ),
+                    )(
                         model,
                         inputs,
                         labels,

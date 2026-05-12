@@ -22,6 +22,13 @@ from torch.testing._internal.common_utils import TestCase
 from torch.utils.checkpoint import checkpoint, CheckpointPolicy
 
 from torchtitan.distributed import ParallelDims
+from torchtitan.experiments.graph_trainer.chunk_passes import (
+    chunk_batch_pass,
+    chunk_seq_pass,
+    import_chunk_dim_metadata_pass,
+    mark_chunk_dynamic_dims,
+    prepare_chunk_trace_inputs,
+)
 from torchtitan.experiments.graph_trainer.common_utils import (
     _MODULE_FQN,
     annotate_module_fqns,
@@ -33,6 +40,7 @@ from torchtitan.experiments.graph_trainer.fsdp_passes import overlap_fsdp_ag_rs_
 from torchtitan.experiments.graph_trainer.graph_utils import export_joint
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
+    run_traced_train_step,
     trace_train_step,
 )
 from torchtitan.experiments.graph_trainer.memory_policy import (
@@ -40,6 +48,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     apply_sac_pass,
 )
 from torchtitan.experiments.graph_trainer.passes import (
+    compile_time_passes,
     remove_detach_pass,
     remove_identity_slice_pass,
     remove_identity_view_pass,
@@ -691,6 +700,593 @@ class TestRemoveDetachPass(TestCase):
         x = torch.randn(4, 4)
         expected = torch.neg(torch.relu(x))
         self.assertEqual(gm(x), expected)
+
+
+class TestChunkPasses(TestCase):
+    def _build_linear_region_gm(self, *, input_shape=(4, 3), fqn="layers.0"):
+        graph = torch.fx.Graph()
+        w = graph.placeholder("w")
+        x = graph.placeholder("x")
+        mm = graph.call_function(torch.ops.aten.mm.default, args=(x, w))
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(mm,))
+        graph.output(relu)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            w_val = torch.empty(input_shape[-1], input_shape[-1])
+            x_val = torch.empty(*input_shape)
+            out_val = torch.empty(*input_shape)
+
+        w.meta["val"] = w_val
+        x.meta["val"] = x_val
+        x.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": input_shape[0]}}
+        for node in (mm, relu):
+            node.meta["val"] = out_val
+            node.meta["custom"] = {_MODULE_FQN: fqn}
+            node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+            node.meta["torchtitan_chunk_dims"] = {
+                "batch": {"dim": 0, "hint": input_shape[0]}
+            }
+        return gm
+
+    def _nodes_by_target(self, gm, target):
+        return [
+            n for n in gm.graph.nodes if n.op == "call_function" and n.target is target
+        ]
+
+    def _build_previous_module_live_in_gm(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        prev = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+        cur = graph.call_function(torch.ops.aten.neg.default, args=(prev,))
+        graph.output(cur)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            val = torch.empty(4, 3)
+
+        x.meta["val"] = val
+        x.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        for node, fqn in ((prev, "layers.0"), (cur, "layers.1")):
+            node.meta["val"] = val
+            node.meta["custom"] = {_MODULE_FQN: fqn}
+            node.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        return gm
+
+    def _build_scalar_live_out_gm(self, *, valid: bool):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+        size = graph.call_function(torch.ops.aten.sym_size.int, args=(relu, 0))
+        scalar = size if valid else graph.call_function(operator.add, args=(size, 1))
+        graph.output((relu, scalar))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            val = torch.empty(4, 3)
+
+        x.meta["val"] = val
+        x.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        relu.meta["val"] = val
+        relu.meta["custom"] = {_MODULE_FQN: "layers.0"}
+        relu.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        size.meta["val"] = 4
+        size.meta["custom"] = {_MODULE_FQN: "layers.0"}
+        if not valid:
+            scalar.meta["val"] = 5
+            scalar.meta["custom"] = {_MODULE_FQN: "layers.0"}
+        return gm
+
+    def _build_opposite_direction_gm(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        backward_node = graph.call_function(torch.ops.aten.neg.default, args=(x,))
+        forward_node = graph.call_function(
+            torch.ops.aten.relu.default, args=(backward_node,)
+        )
+        graph.output(forward_node)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            val = torch.empty(4, 3)
+
+        x.meta["val"] = val
+        x.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        backward_node.meta["val"] = val
+        backward_node.meta["autograd_backward"] = True
+        forward_node.meta["val"] = val
+        forward_node.meta["custom"] = {_MODULE_FQN: "layers.0"}
+        return gm
+
+    def _build_forward_non_additive_no_dim_live_out_gm(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+        amax = graph.call_function(torch.ops.aten.amax.default, args=(relu, [0], False))
+        graph.output((relu, amax))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            val = torch.empty(4, 3)
+            reduced_val = torch.empty(3)
+
+        x.meta["val"] = val
+        x.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        relu.meta["val"] = val
+        relu.meta["custom"] = {_MODULE_FQN: "layers.0"}
+        relu.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        amax.meta["val"] = reduced_val
+        amax.meta["custom"] = {_MODULE_FQN: "layers.0"}
+        return gm
+
+    def _build_backward_internal_no_dim_live_out_gm(self):
+        graph = torch.fx.Graph()
+        w = graph.placeholder("w")
+        x = graph.placeholder("x")
+        grad_out = graph.placeholder("grad_out")
+        grad_act = graph.call_function(torch.ops.aten.mm.default, args=(grad_out, w))
+        x_t = graph.call_function(torch.ops.aten.t.default, args=(x,))
+        grad_w = graph.call_function(torch.ops.aten.mm.default, args=(x_t, grad_out))
+        post = graph.call_function(torch.ops.aten.neg.default, args=(grad_w,))
+        graph.output((grad_act, post))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            w_val = torch.empty(3, 3)
+            val = torch.empty(4, 3)
+            x_t_val = torch.empty(3, 4)
+
+        w.meta["val"] = w_val
+        x.meta["val"] = val
+        x.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        grad_out.meta["val"] = val
+        grad_out.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        grad_act.meta["val"] = val
+        grad_act.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        x_t.meta["val"] = x_t_val
+        grad_w.meta["val"] = w_val
+        post.meta["val"] = w_val
+        for node in (grad_act, x_t, grad_w):
+            node.meta["custom"] = {_MODULE_FQN: "layers.0"}
+            node.meta["autograd_backward"] = True
+        return gm
+
+    def _build_dsv3_debug_model(self, *, seed: int):
+        from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        model_config = model_registry(
+            "debugmodel",
+            attn_backend="sdpa",
+            moe_comm_backend="standard",
+        ).model
+        with torch.device("meta"):
+            model = model_config.build()
+        model.to_empty(device="cuda")
+        with torch.no_grad():
+            model.init_states(buffer_device=None)
+        model.train()
+        return model, model_config
+
+    def _wrap_forward_with_eager_chunking(self, module, *, dim: int) -> None:
+        inner_forward = module.forward
+
+        def chunked_forward(*args, **kwargs):
+            if not args or not isinstance(args[0], torch.Tensor):
+                raise AssertionError("chunked module forward expects tensor arg0")
+            chunks = args[0].split(args[0].shape[dim] // 2, dim=dim)
+            outputs = []
+            for chunk in chunks:
+                chunk_args = (chunk.contiguous(), *args[1:])
+                outputs.append(inner_forward(*chunk_args, **kwargs))
+            return torch.cat(outputs, dim=dim)
+
+        module.forward = chunked_forward
+
+    def _dsv3_chunk_step(self, module, *inputs):
+        pred = module(*inputs)
+        loss = pred.float().sum()
+        params = [p for p in module.parameters() if p.requires_grad]
+        return [loss, pred] + list(torch.autograd.grad(loss, params))
+
+    def _dsv3_layers_step(self, layers, hidden, freqs_cis):
+        pred = hidden
+        for layer in layers.values():
+            pred = layer(pred, freqs_cis, None, None)
+        loss = pred.float().sum()
+        params = [p for p in layers.parameters() if p.requires_grad]
+        return [loss, pred] + list(torch.autograd.grad(loss, params))
+
+    def _assert_bitwise_equal_outputs(self, actual, expected, *, case_name: str):
+        self.assertEqual(len(actual), len(expected), case_name)
+        for idx, (actual_tensor, expected_tensor) in enumerate(zip(actual, expected)):
+            self.assertTrue(
+                torch.equal(actual_tensor, expected_tensor),
+                f"{case_name} output {idx} mismatch: "
+                f"max_abs_diff={(actual_tensor - expected_tensor).abs().max()}",
+            )
+
+    def test_chunk_batch_forward_region_semantics(self):
+        gm = self._build_linear_region_gm()
+        w = torch.randn(3, 3)
+        x = torch.randn(4, 3)
+        expected = gm(w, x)
+
+        chunk_batch_pass(
+            gm,
+            module_patterns=["layers.*"],
+            num_static_inputs=1,
+        )
+
+        actual = gm(w, x)
+        self.assertEqual(actual, expected)
+
+        split_nodes = self._nodes_by_target(gm, torch.ops.aten.split.Tensor)
+        cat_nodes = self._nodes_by_target(gm, torch.ops.aten.cat.default)
+        mm_nodes = self._nodes_by_target(gm, torch.ops.aten.mm.default)
+
+        self.assertEqual(len(split_nodes), 1)
+        self.assertEqual(split_nodes[0].args[0].name, "x")
+        self.assertEqual(len(cat_nodes), 1)
+        self.assertEqual(cat_nodes[0].args[1], 0)
+        self.assertEqual(len(mm_nodes), 2)
+        self.assertEqual({n.meta.get("chunk_id") for n in mm_nodes}, {0, 1})
+        self.assertTrue(
+            all(
+                n.meta.get("recompute") is CheckpointPolicy.PREFER_RECOMPUTE
+                for n in cat_nodes
+            )
+        )
+
+        gm = self._build_previous_module_live_in_gm()
+        inp = torch.randn(4, 3)
+        expected = gm(inp)
+
+        chunk_batch_pass(gm, module_patterns=["layers.1"])
+
+        actual = gm(inp)
+        self.assertEqual(actual, expected)
+
+        relu_nodes = self._nodes_by_target(gm, torch.ops.aten.relu.default)
+        neg_nodes = self._nodes_by_target(gm, torch.ops.aten.neg.default)
+        self.assertEqual(len(relu_nodes), 1)
+        self.assertEqual(len(neg_nodes), 2)
+        self.assertEqual({n.meta.get("chunk_id") for n in neg_nodes}, {0, 1})
+
+        gm = self._build_scalar_live_out_gm(valid=True)
+        inp = torch.randn(4, 3)
+        expected = gm(inp)
+
+        chunk_batch_pass(gm, module_patterns=["layers.*"])
+
+        actual = gm(inp)
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1])
+
+    def test_chunk_pass_guardrails_and_pipeline_order(self):
+        with self.assertRaisesRegex(ValueError, "Cannot split annotated batch"):
+            chunk_batch_pass(
+                self._build_linear_region_gm(input_shape=(3, 3)),
+                module_patterns=["layers.*"],
+                num_static_inputs=1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "opposite graph direction"):
+            chunk_batch_pass(
+                self._build_opposite_direction_gm(),
+                module_patterns=["layers.*"],
+            )
+
+        with self.assertRaisesRegex(NotImplementedError, "full-K/V"):
+            chunk_seq_pass(
+                self._build_linear_region_gm(
+                    input_shape=(2, 4, 3), fqn="layers.0.attention"
+                ),
+                module_patterns=["layers.*.attention"],
+                num_static_inputs=1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "cannot materialize scalar live-out"):
+            chunk_batch_pass(
+                self._build_scalar_live_out_gm(valid=False),
+                module_patterns=["layers.*"],
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "forward additive provenance or a backward graph output parameter gradient",
+        ):
+            chunk_batch_pass(
+                self._build_forward_non_additive_no_dim_live_out_gm(),
+                module_patterns=["layers.*"],
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "forward additive provenance or a backward graph output parameter gradient",
+        ):
+            chunk_batch_pass(
+                self._build_backward_internal_no_dim_live_out_gm(),
+                module_patterns=["layers.*"],
+            )
+
+        chunk_batch_pass(
+            self._build_linear_region_gm(fqn="layers.0.moe"),
+            module_patterns=["layers.*.moe"],
+            num_static_inputs=1,
+            module_bucket_plans=["layers.0"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "scheduling boundaries"):
+            chunk_batch_pass(
+                self._build_linear_region_gm(fqn="tok_embeddings"),
+                module_patterns=["tok_embeddings"],
+                num_static_inputs=1,
+                module_bucket_plans=["tok_embeddings", "layers.0"],
+            )
+
+        from types import SimpleNamespace
+
+        traced_result = SimpleNamespace(num_static_inputs=2)
+        config = SimpleNamespace(
+            model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
+            parallelism=SimpleNamespace(
+                enable_async_tensor_parallel=False,
+                fsdp_reshard_after_forward="default",
+                pipeline_parallel_degree=1,
+            ),
+            compile=SimpleNamespace(
+                chunk_modules=["layers.*"],
+                chunk_mode="batch",
+                cpu_offload_prefetch_n_layers=1,
+                cpu_offload_defer_n_layers=1,
+                cpu_offload_budget_gb=1.0,
+                memory_policy="default",
+                inductor_compilation="full",
+                numerics_changing_optim=False,
+            ),
+        )
+
+        def pass_name(pass_fn):
+            return (
+                pass_fn.func.__name__ if hasattr(pass_fn, "func") else pass_fn.__name__
+            )
+
+        names = [
+            pass_name(pass_fn)
+            for pass_fn in compile_time_passes(
+                traced_result, config, use_cudagraph=False
+            )
+        ]
+        self.assertLess(
+            names.index("apply_cpu_offload_pass"),
+            names.index("chunk_batch_pass"),
+        )
+        self.assertLess(
+            names.index("chunk_batch_pass"),
+            names.index("selective_activation_remat_pass"),
+        )
+
+        x = torch.randn(4, 4)
+        prepare_chunk_trace_inputs(config.compile, (x,), {})
+        self.assertTrue(hasattr(x, "_torchtitan_chunk_dims"))
+
+        config.compile.chunk_mode = None
+        with self.assertRaisesRegex(ValueError, "chunk_mode must be set"):
+            prepare_chunk_trace_inputs(config.compile, (torch.randn(4, 4),), {})
+
+    def test_chunk_batch_backward_cats_activation_grad_and_sums_param_grad(self):
+        graph = torch.fx.Graph()
+        w = graph.placeholder("w")
+        x = graph.placeholder("x")
+        grad_out = graph.placeholder("grad_out")
+        grad_act = graph.call_function(torch.ops.aten.mm.default, args=(grad_out, w))
+        x_t = graph.call_function(torch.ops.aten.t.default, args=(x,))
+        grad_w = graph.call_function(torch.ops.aten.mm.default, args=(x_t, grad_out))
+        graph.output((grad_act, grad_w))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            w_val = torch.empty(3, 3)
+            act_val = torch.empty(4, 3)
+            x_t_val = torch.empty(3, 4)
+
+        w.meta["val"] = w_val
+        x.meta["val"] = act_val
+        x.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        grad_out.meta["val"] = act_val
+        grad_out.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        grad_act.meta["val"] = act_val
+        grad_act.meta["torchtitan_chunk_dims"] = {"batch": {"dim": 0, "hint": 4}}
+        x_t.meta["val"] = x_t_val
+        grad_w.meta["val"] = w_val
+        for node in (grad_act, x_t, grad_w):
+            node.meta["custom"] = {_MODULE_FQN: "layers.0"}
+            node.meta["autograd_backward"] = True
+
+        w_real = torch.randn(3, 3)
+        x_real = torch.randn(4, 3)
+        grad_out_real = torch.randn(4, 3)
+        expected = gm(w_real, x_real, grad_out_real)
+
+        chunk_batch_pass(
+            gm,
+            module_patterns=["layers.*"],
+            num_static_inputs=1,
+        )
+
+        actual = gm(w_real, x_real, grad_out_real)
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1])
+
+        cat_nodes = self._nodes_by_target(gm, torch.ops.aten.cat.default)
+        sum_nodes = self._nodes_by_target(gm, torch.ops.aten.add.Tensor)
+        self.assertEqual(len(cat_nodes), 1)
+        self.assertEqual(len(sum_nodes), 1)
+        self.assertTrue(all(n.meta.get("autograd_backward") for n in sum_nodes))
+
+    def test_chunk_batch_on_traced_toy_model(self):
+        model = ToyModel(dim=4, n_layers=1)
+        annotate_module_fqns(model)
+        x = torch.randn(4, 4)
+        mark_chunk_dynamic_dims(x, mode="batch")
+
+        def step(module, inputs):
+            y = module(inputs)
+            loss = y.sum()
+            params = [p for p in module.parameters() if p.requires_grad]
+            return [loss] + list(torch.autograd.grad(loss, params))
+
+        traced = trace_train_step(step)(model, x)
+        expected = step(model, x)
+
+        import_chunk_dim_metadata_pass(
+            traced.gm,
+            traced.example_inputs,
+            mode="batch",
+        )
+        chunk_batch_pass(
+            traced.gm,
+            module_patterns=["layers.*"],
+            num_static_inputs=traced.num_static_inputs,
+        )
+
+        actual = run_traced_train_step(traced, model, x)
+        self.assertEqual(len(actual), len(expected))
+        for actual_tensor, expected_tensor in zip(actual, expected):
+            self.assertEqual(actual_tensor, expected_tensor)
+        self.assertGreater(
+            sum(1 for node in traced.gm.graph.nodes if node.meta.get("chunk_id") == 0),
+            0,
+        )
+
+    def test_dsv3_debug_chunk_pass_matches_eager_chunking_bitwise(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+
+        cases = [
+            (
+                "batch_all_transformer_blocks",
+                "batch",
+                ["layers.*"],
+                lambda model: list(model.layers.values()),
+                lambda model: {f"layers.{name}" for name in model.layers},
+                4,
+            ),
+            (
+                "batch_all_moe_blocks",
+                "batch",
+                ["layers.*.moe"],
+                lambda model: [
+                    layer.moe for layer in model.layers.values() if layer.moe_enabled
+                ],
+                lambda model: {
+                    f"layers.{name}.moe"
+                    for name, layer in model.layers.items()
+                    if layer.moe_enabled
+                },
+                4,
+            ),
+            (
+                "seq_all_moe_blocks",
+                "seq",
+                ["layers.*.moe"],
+                lambda model: [
+                    layer.moe for layer in model.layers.values() if layer.moe_enabled
+                ],
+                lambda model: {
+                    f"layers.{name}.moe"
+                    for name, layer in model.layers.items()
+                    if layer.moe_enabled
+                },
+                4,
+            ),
+        ]
+
+        seq_len = 16
+        seed = 42
+        for case_name, mode, patterns, module_getter, root_getter, batch_size in cases:
+            with self.subTest(case=case_name):
+                eager_model, _ = self._build_dsv3_debug_model(seed=seed)
+                graph_model, _ = self._build_dsv3_debug_model(seed=seed)
+                eager_modules = module_getter(eager_model)
+                self.assertGreater(len(eager_modules), 0, case_name)
+                for module in eager_modules:
+                    self._wrap_forward_with_eager_chunking(
+                        module,
+                        dim=0 if mode == "batch" else 1,
+                    )
+                annotate_module_fqns(graph_model)
+                expected_roots = root_getter(graph_model)
+                self.assertGreater(len(expected_roots), 0, case_name)
+
+                torch.manual_seed(seed + 1)
+                hidden = torch.randn(
+                    batch_size,
+                    seq_len,
+                    graph_model.config.dim,
+                    device="cuda",
+                )
+                graph_hidden = hidden.clone()
+                mark_chunk_dynamic_dims(graph_hidden, mode=mode)
+                eager_args = (hidden, eager_model.freqs_cis)
+                graph_args = (graph_hidden, graph_model.freqs_cis)
+
+                eager_traced = trace_train_step(self._dsv3_layers_step)(
+                    eager_model.layers,
+                    *eager_args,
+                )
+                expected = run_traced_train_step(
+                    eager_traced, eager_model.layers, *eager_args
+                )
+                traced = trace_train_step(self._dsv3_layers_step)(
+                    graph_model.layers,
+                    *graph_args,
+                )
+                import_chunk_dim_metadata_pass(
+                    traced.gm,
+                    traced.example_inputs,
+                    mode=mode,
+                )
+                if mode == "batch":
+                    chunk_batch_pass(
+                        traced.gm,
+                        module_patterns=patterns,
+                        num_static_inputs=traced.num_static_inputs,
+                    )
+                else:
+                    chunk_seq_pass(
+                        traced.gm,
+                        module_patterns=patterns,
+                        num_static_inputs=traced.num_static_inputs,
+                    )
+                actual = run_traced_train_step(traced, graph_model.layers, *graph_args)
+
+                self._assert_bitwise_equal_outputs(
+                    actual,
+                    expected,
+                    case_name=case_name,
+                )
+                chunk_ids = {
+                    node.meta.get("chunk_id")
+                    for node in traced.gm.graph.nodes
+                    if "chunk_id" in node.meta
+                }
+                self.assertEqual(chunk_ids, {0, 1})
+                chunked_roots = {
+                    node.meta.get("chunked_region_fqn")
+                    for node in traced.gm.graph.nodes
+                    if "chunked_region_fqn" in node.meta
+                }
+                self.assertTrue(expected_roots <= chunked_roots)
 
 
 class TestRemoveIdentityViewPass(TestCase):

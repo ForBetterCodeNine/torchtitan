@@ -52,3 +52,6 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+
+# Codex user-local workflow state
+/.codex/local/

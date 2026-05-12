@@ -563,7 +563,11 @@ def run_traced(
     return pytree.tree_unflatten(wrapped, traced_result.output_spec)
 
 
-def trace_train_step(fn: Callable) -> Callable[..., TracedResult]:
+def trace_train_step(
+    fn: Callable,
+    *,
+    prepare_inputs: Callable[[tuple[Any, ...], dict[str, Any]], None] | None = None,
+) -> Callable[..., TracedResult]:
     """Reference implementation for capturing a whole train step via the core API."""
 
     def _trace_with_module(
@@ -575,6 +579,8 @@ def trace_train_step(fn: Callable) -> Callable[..., TracedResult]:
                 f"got {type(module).__name__}."
             )
         _check_no_extra_module_in_user_inputs(args, kwargs, "trace_train_step")
+        if prepare_inputs is not None:
+            prepare_inputs(args, kwargs)
 
         def _stateless_fn(
             state: dict[str, torch.Tensor], *user_args: Any, **user_kwargs: Any

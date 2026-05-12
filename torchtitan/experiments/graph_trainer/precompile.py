@@ -71,6 +71,8 @@ def compute_config_fingerprint(
     h.update(f"compile:backend:{compile_config.backend}\n".encode())
     h.update(f"compile:passes:{list(compile_config.passes)}\n".encode())
     h.update(f"compile:joint_passes:{list(compile_config.joint_passes)}\n".encode())
+    h.update(f"compile:chunk_modules:{list(compile_config.chunk_modules)}\n".encode())
+    h.update(f"compile:chunk_mode:{compile_config.chunk_mode}\n".encode())
 
     # Include PyTorch version since compiled artifacts (AOT graphs,
     # Triton kernels) are not guaranteed to be compatible across

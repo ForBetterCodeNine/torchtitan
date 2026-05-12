@@ -40,13 +40,17 @@ def _is_backward_node(node: torch.fx.Node) -> bool:
     return node.meta.get("autograd_backward", False)
 
 
+def _get_module_fqn(node: torch.fx.Node) -> str:
+    return node.meta.get("custom", {}).get(_MODULE_FQN, "")
+
+
 def _get_layer_id(node: torch.fx.Node) -> int:
     """Extract the layer index from the node's module_fqn metadata.
 
     Nodes under ``layers.<N>`` return ``N``.
     All other nodes (tok_embeddings, norm, output) return ``_NOT_IN_LAYERS``.
     """
-    fqn = node.meta.get("custom", {}).get(_MODULE_FQN, "")
+    fqn = _get_module_fqn(node)
     parts = fqn.split(".")
     if parts[0] == "layers" and len(parts) >= 2:
         try:
@@ -68,6 +72,42 @@ def annotate_module_fqns(model: nn.Module) -> None:
     for fqn, submodule in model.named_modules():
         if fqn:  # skip root module
             submodule.forward = annotate_fn({_MODULE_FQN: fqn})(submodule.forward)
+
+
+# ---------------------------------------------------------------------------
+# Chunk pass utilities
+# ---------------------------------------------------------------------------
+# These helpers are shared by chunk passes and tests around graph_trainer's
+# traced FX metadata. Keep chunk-specific rewrite policy in chunk_passes.py.
+
+
+def _is_module_fqn_inside_root(fqn: str, root_fqn: str) -> bool:
+    return fqn == root_fqn or fqn.startswith(root_fqn + ".")
+
+
+def _tensor_meta(node: torch.fx.Node) -> torch.Tensor | None:
+    val = node.meta.get("val")
+    return val if isinstance(val, torch.Tensor) else None
+
+
+def _free_symbols(value: object) -> frozenset[object]:
+    from torch.fx.experimental.symbolic_shapes import free_symbols
+
+    return frozenset(free_symbols(value))
+
+
+def _dynamic_dim_symbols(val: torch.Tensor, dim: int) -> frozenset[object]:
+    return _free_symbols(val.shape[dim])
+
+
+def _ordered_nodes(gm: torch.fx.GraphModule) -> dict[torch.fx.Node, int]:
+    return {n: i for i, n in enumerate(gm.graph.nodes)}
+
+
+def _earliest_node(
+    nodes: list[torch.fx.Node], order: dict[torch.fx.Node, int]
+) -> torch.fx.Node:
+    return min(nodes, key=lambda n: order[n])
 
 
 def parallelize_inputs(parallel_dims, args, kwargs):
