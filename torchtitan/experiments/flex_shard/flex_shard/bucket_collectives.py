@@ -123,6 +123,22 @@ class ReduceScatterGradHandle:
 
 
 @dataclass
+class SyncAllGatherResult(AllGatherUnshardHandle):
+    """Already-finished all-gather result used during graph capture."""
+
+    full_params: list[torch.Tensor]
+
+    def finish(self) -> list[torch.Tensor]:
+        return self.full_params
+
+    def wait(self) -> None:
+        return
+
+    def release_buffers(self) -> None:
+        return
+
+
+@dataclass
 class AsyncAllGatherResult(AllGatherUnshardHandle):
     """State needed to finish an async all-gather launched on a side stream."""
 
@@ -254,7 +270,6 @@ def begin_all_gather_unshard(
     pg = mesh.get_group()
     dtype = tensors[0].dtype
     device = tensors[0].device
-    device_handle = _get_device_handle(device.type)
 
     with _record_function_if_eager("FlexShard::all_gather_copy_in", debug_fqn):
         send_buf = torch.cat([t.reshape(-1) for t in tensors])
@@ -274,6 +289,20 @@ def begin_all_gather_unshard(
             torch.empty(per_rank_sizes[r], dtype=dtype, device=device)
             for r in range(ws)
         ]
+
+    if torch.compiler.is_compiling():
+        _run_all_gather(gathered, send_buf, pg, debug_fqn)
+        return SyncAllGatherResult(
+            _finish_all_gather(
+                gathered,
+                infos,
+                mesh,
+                per_rank_param_offsets,
+                debug_fqn,
+            )
+        )
+
+    device_handle = _get_device_handle(device.type)
 
     copy_in_done = device_handle.Event()
     copy_in_done.record(device_handle.current_stream(device))
@@ -358,6 +387,30 @@ class AsyncReduceScatterResult(ReduceScatterGradHandle):
         self.event.record(stream)
 
 
+@dataclass
+class SyncReduceScatterResult(ReduceScatterGradHandle):
+    """Already-finished reduce-scatter result used during graph capture."""
+
+    sharded_grads: list[torch.Tensor]
+
+    def finish(self) -> list[torch.Tensor]:
+        return self.sharded_grads
+
+    def wait(self) -> None:
+        return
+
+    def release_buffers(self, release_sharded_grads: bool) -> None:
+        if release_sharded_grads:
+            self.sharded_grads.clear()
+
+    def record_sharded_grads(
+        self,
+        sharded_grads: list[torch.Tensor],
+        stream: torch.Stream,
+    ) -> None:
+        self.sharded_grads = sharded_grads
+
+
 def _run_reduce_scatter(
     send_buf: torch.Tensor,
     world_size: int,
@@ -427,6 +480,20 @@ def begin_reduce_scatter_grad(
             )
 
     device = send_buf.device
+
+    if torch.compiler.is_compiling():
+        recv_buf = _run_reduce_scatter(send_buf, ws, pg, debug_fqn)
+        sharded_grads = _finish_reduce_scatter(
+            placement,
+            recv_buf,
+            infos,
+            layout,
+            rank,
+            ws,
+            debug_fqn,
+        )
+        return SyncReduceScatterResult(sharded_grads)
+
     device_handle = _get_device_handle(device.type)
     copy_in_done = device_handle.Event()
     copy_in_done.record(device_handle.current_stream(device))

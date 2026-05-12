@@ -128,7 +128,7 @@ class BucketCommContext:
 
 @dataclass
 class BucketAllGatherRuntime:
-    """Runtime metadata passed to reshard-after-forward bucket autograd."""
+    """Runtime metadata passed to bucket autograd all-gather."""
 
     bucket: BucketRuntime
     prefetched_result: AllGatherUnshardHandle | None
@@ -419,8 +419,6 @@ class BucketRuntime:
         self.reduce_grads(grads, infos, param_refs)
 
     def pre_forward_hook(self, mod, args) -> None:
-        if torch.compiler.is_compiling():
-            return
         local_shards = self._local_shards(use_autograd=self.use_autograd_unshard)
         if self.use_autograd_unshard:
             prefetched_result = self.take_pending()
@@ -449,8 +447,6 @@ class BucketRuntime:
             param_state._pre_gathered = full_param
 
     def post_forward_hook(self, mod, args, output) -> None:
-        if torch.compiler.is_compiling():
-            return
         for _, param_state, _ in self.entries:
             param_state._pre_gathered = None
         if self.use_autograd_unshard:
@@ -482,7 +478,7 @@ class BucketRuntime:
 
 
 class _BucketAllGather(torch.autograd.Function):
-    """Autograd boundary for reshard-after-forward bucket all-gather.
+    """Autograd boundary for bucket all-gather.
 
     Forward consumes a raw all-gather result, either prefetched by the previous
     bucket or launched on demand. Backward packs full-parameter gradients and
@@ -553,9 +549,7 @@ def _storage_requires_batched_unshard(storage: DStorage) -> bool:
 
 
 def _storage_uses_bucket_autograd_unshard(storage: DStorage) -> bool:
-    """Return whether reshard-after-forward should use the custom bucket autograd path."""
-    if not storage._reshard_after_forward:
-        return False
+    """Return whether this bucket should use the custom autograd path."""
     if not storage._param_infos:
         return False
     return _get_bucket_autograd_unshard_unsupported_reason(storage) is None
@@ -564,7 +558,7 @@ def _storage_uses_bucket_autograd_unshard(storage: DStorage) -> bool:
 def _get_bucket_autograd_unshard_unsupported_reason(
     storage: DStorage,
 ) -> str | None:
-    """Return why a reshard-after-forward bucket cannot use the custom autograd path."""
+    """Return why a bucket cannot use the custom autograd path."""
     infos = list(storage._param_infos.values())
     if not infos:
         return None
@@ -652,8 +646,8 @@ def _install_batched_allgather_hooks(
     _pre_gathered on each parameter access state so the property getter can
     return the hook-provided tensor.
 
-    Skipped under graph capture. FlexShard currently supports eager execution
-    only, so parameter access will raise before collectives are emitted.
+    CUDA buckets use the custom autograd bucket path in both eager and compile
+    so Dynamo traces the same bucket pre-hook and parameter access logic.
     """
     for storage in storages:
         if not _storage_requires_batched_unshard(storage):
