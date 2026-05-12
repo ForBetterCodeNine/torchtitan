@@ -392,10 +392,13 @@ def apply_moe_ep_tp(
                     desired_output_layouts=(sp_layout,),
                     use_local_output=False,
                 ),
-                # GroupedExperts output placement on the TP mesh.
+                # GroupedExperts output is local (SP-sharded tokens + TP
+                # partial sums). Kept local so MoE.forward() can reshape
+                # before the "moe" boundary wraps it as DTensor.
                 "moe.experts": PrepareModuleOutput(
                     output_layouts=Partial(),
                     desired_output_layouts=Partial(),
+                    use_local_output=True,
                 ),
                 # Replicate computation for the router. NoParallel keeps
                 # gate weights Replicate and all-gathers input if needed
@@ -416,6 +419,7 @@ def apply_moe_ep_tp(
                         ),
                         "moe.shared_experts.w2": RowwiseParallel(
                             output_layouts=Partial(),
+                            use_local_output=True,
                         ),
                         "moe.shared_experts.w3": ColwiseParallel(
                             input_layouts=moe_desired_input_layouts,

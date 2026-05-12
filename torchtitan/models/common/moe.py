@@ -392,7 +392,6 @@ class MoE(Module):
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
-        # Convert to local for combine's scatter_add compatibility.
         shared_out = self.shared_experts(x) if self.shared_experts is not None else None
 
         # Routed experts convert to local tensor at GroupedExperts boundary.
