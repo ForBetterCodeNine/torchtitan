@@ -56,13 +56,16 @@ class SFTTrainer(Trainer):
                 prepare_context_parallel_input,
             )
 
+            load_balancer = self.config.parallelism.context_parallel_load_balancer
+            if attn_mask_type == "block_causal":
+                load_balancer = "ptrr"
             inputs, labels, extra_kwargs = prepare_context_parallel_input(
                 inputs,
                 labels,
                 extra_kwargs,
                 self.parallel_dims.get_mesh("cp"),
                 self.device,
-                self.config.parallelism.context_parallel_load_balancer,
+                load_balancer,
             )
 
         self.ntokens_seen += labels.numel()

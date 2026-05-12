@@ -28,6 +28,9 @@ from torchtitan.protocols.module import ModuleDict
 from torchtitan.tools.logging import logger
 
 
+_cp_mesh = None
+
+
 def _flex_torchtitan_attention_forward(
     module, query, key, value, attention_mask, **kwargs
 ):
@@ -36,8 +39,22 @@ def _flex_torchtitan_attention_forward(
     HF's flex_attention_forward passes return_lse=True which triggers a
     deprecated warnings.warn in PyTorch's flex_attention, breaking dynamo.
     This avoids that by not requesting LSE.
+
+    When context parallel is active, all-gathers K/V before attention.
     """
     from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+    if _cp_mesh is not None:
+        from torch.distributed.tensor.experimental._context_parallel._attention import (
+            flex_cp_allgather,
+        )
+        import torch.distributed as dist
+
+        pg_name = dist._get_process_group_name(_cp_mesh.get_group())
+        key = key.contiguous()
+        value = value.contiguous()
+        # HF layout is (batch, heads, seq, dim) — gather along seq dim (2)
+        key, value = flex_cp_allgather(key, value, 2, pg_name)
 
     scaling = kwargs.get("scaling")
 
@@ -397,7 +414,9 @@ class HFTransformerModel(BaseModel):
             layer.moe_enabled = False
 
     def set_cp_mesh(self, mesh):
+        global _cp_mesh
         self.cp_mesh = mesh
+        _cp_mesh = mesh
 
     def _patch_hf_llama_like(self, decoder_layer_cls, attention_cls, mlp_cls=None):
         """
