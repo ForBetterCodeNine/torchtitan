@@ -13,7 +13,9 @@ import torch
 import torch.nn as nn
 from torch.fx.traceback import annotate_fn
 
-from torchtitan.experiments.graph_trainer.chunk_passes import prepare_chunk_trace_inputs
+from torchtitan.experiments.graph_trainer.chunk_passes import (
+    prepare_ep_overlap_trace_inputs,
+)
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _MODULE_FQN,
@@ -173,7 +175,7 @@ class GraphTrainer(Trainer):
                     self._traced_step = trace_train_step(
                         fwd_bwd_fn,
                         prepare_inputs=functools.partial(
-                            prepare_chunk_trace_inputs,
+                            prepare_ep_overlap_trace_inputs,
                             self.config.compile,
                         ),
                     )(

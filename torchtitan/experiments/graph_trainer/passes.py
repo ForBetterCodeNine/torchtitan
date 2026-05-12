@@ -32,8 +32,7 @@ import torch
 from torch._logging import trace_structured
 
 from torchtitan.experiments.graph_trainer.chunk_passes import (
-    chunk_batch_pass,
-    chunk_seq_pass,
+    ep_overlap_pass,
     import_chunk_dim_metadata_pass,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import apply_cpu_offload_pass
@@ -175,31 +174,32 @@ def compile_time_passes(
             defer_n_layers=config.compile.cpu_offload_defer_n_layers,
         ),
     ]
-    if config.compile.chunk_modules:
-        chunk_mode = config.compile.chunk_mode
-        if chunk_mode not in ("batch", "seq"):
+    if "ep_overlap" in config.compile.passes:
+        overlap_mode = config.compile.ep_overlap_mode
+        if overlap_mode not in ("batch", "seq"):
             raise ValueError(
-                "--compile.chunk_mode must be 'batch' or 'seq' when "
-                "--compile.chunk_modules is non-empty"
+                "--compile.ep_overlap_mode must be 'batch' or 'seq' when "
+                "--compile.passes contains ep_overlap"
             )
-        chunk_pass = chunk_batch_pass if chunk_mode == "batch" else chunk_seq_pass
+        if not config.compile.ep_overlap_modules:
+            raise ValueError(
+                "--compile.ep_overlap_modules must be non-empty when "
+                "--compile.passes contains ep_overlap"
+            )
         passes.extend(
             [
                 functools.partial(
                     import_chunk_dim_metadata_pass,
-                    mode=chunk_mode,
+                    mode=overlap_mode,
                 ),
                 functools.partial(
-                    chunk_pass,
-                    module_patterns=config.compile.chunk_modules,
+                    ep_overlap_pass,
+                    mode=overlap_mode,
+                    module_patterns=config.compile.ep_overlap_modules,
                     num_static_inputs=traced_result.num_static_inputs,
                     module_bucket_plans=module_bucket_plans,
                 ),
             ]
-        )
-    elif config.compile.chunk_mode is not None:
-        raise ValueError(
-            "--compile.chunk_modules must be non-empty when --compile.chunk_mode is set"
         )
     passes.extend(
         [

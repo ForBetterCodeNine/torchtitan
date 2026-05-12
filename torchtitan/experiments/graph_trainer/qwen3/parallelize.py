@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torch.fx.traceback import annotate_fn
-
 from torchtitan.config import (
     ActivationCheckpointConfig,
     CompileConfig,
@@ -15,6 +13,7 @@ from torchtitan.config import (
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
+    annotate_moe_ep_regions,
     apply_cp_to_attention,
     apply_simple_fsdp,
 )
@@ -34,16 +33,7 @@ def annotate_qwen3(model: GraphTrainerQwen3Model) -> None:
     """
     # Annotate MoE EP regions if any layer has MoE enabled
     if any(layer.moe is not None for layer in model.config.layers):
-        from torchtitan.models.common.moe import MoE
-        from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
-
-        LocalTokenDispatcher.dispatch = annotate_fn({"EP": "dispatch"})(
-            LocalTokenDispatcher.dispatch
-        )
-        LocalTokenDispatcher.combine = annotate_fn({"EP": "combine"})(
-            LocalTokenDispatcher.combine
-        )
-        MoE.forward = annotate_fn({"EP": "compute"})(MoE.forward)
+        annotate_moe_ep_regions()
 
     annotate_module_fqns(model)
 

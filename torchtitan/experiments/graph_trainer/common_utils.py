@@ -74,6 +74,30 @@ def annotate_module_fqns(model: nn.Module) -> None:
             submodule.forward = annotate_fn({_MODULE_FQN: fqn})(submodule.forward)
 
 
+def _annotate_method_once(cls: type, method_name: str, meta: dict[str, str]) -> None:
+    method = getattr(cls, method_name)
+    marker = f"_torchtitan_annotated_{'_'.join(f'{k}_{v}' for k, v in meta.items())}"
+    if getattr(method, marker, False):
+        return
+    wrapped = annotate_fn(meta)(method)
+    setattr(wrapped, marker, True)
+    setattr(cls, method_name, wrapped)
+
+
+def annotate_moe_ep_regions() -> None:
+    """Annotate MoE EP compute, dispatch, and combine regions for FX passes."""
+    from torchtitan.models.common.moe import MoE
+    from torchtitan.models.common.token_dispatcher import (
+        AllToAllTokenDispatcher,
+        LocalTokenDispatcher,
+    )
+
+    for dispatcher_cls in (LocalTokenDispatcher, AllToAllTokenDispatcher):
+        _annotate_method_once(dispatcher_cls, "dispatch", {"EP": "dispatch"})
+        _annotate_method_once(dispatcher_cls, "combine", {"EP": "combine"})
+    _annotate_method_once(MoE, "forward", {"EP": "compute"})
+
+
 # ---------------------------------------------------------------------------
 # Chunk pass utilities
 # ---------------------------------------------------------------------------

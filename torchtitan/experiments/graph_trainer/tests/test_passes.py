@@ -23,15 +23,18 @@ from torch.utils.checkpoint import checkpoint, CheckpointPolicy
 
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.chunk_passes import (
+    _schedule_ep_overlap_regions,
     chunk_batch_pass,
     chunk_seq_pass,
+    ep_overlap_pass,
     import_chunk_dim_metadata_pass,
     mark_chunk_dynamic_dims,
-    prepare_chunk_trace_inputs,
+    prepare_ep_overlap_trace_inputs,
 )
 from torchtitan.experiments.graph_trainer.common_utils import (
     _MODULE_FQN,
     annotate_module_fqns,
+    annotate_moe_ep_regions,
 )
 from torchtitan.experiments.graph_trainer.cudagraph import (
     insert_kernel_annotations_pass,
@@ -735,6 +738,58 @@ class TestChunkPasses(TestCase):
             n for n in gm.graph.nodes if n.op == "call_function" and n.target is target
         ]
 
+    def _build_ep_overlap_schedule_gm(self, *, backward: bool = False):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        c10d = torch.ops._c10d_functional
+        outputs = []
+        for chunk_id in (0, 1):
+            pre = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+            first_launch = graph.call_function(
+                c10d.all_to_all_single.default,
+                args=(pre, [], [], "ep"),
+            )
+            first_wait = graph.call_function(
+                torch.ops.aten.relu.default, args=(first_launch,)
+            )
+            compute = graph.call_function(
+                torch.ops.aten.neg.default, args=(first_wait,)
+            )
+            second_launch = graph.call_function(
+                c10d.all_to_all_single.default,
+                args=(compute, [], [], "ep"),
+            )
+            second_wait = graph.call_function(
+                torch.ops.aten.relu.default, args=(second_launch,)
+            )
+            tail = graph.call_function(torch.ops.aten.neg.default, args=(second_wait,))
+            outputs.append(tail)
+
+            first_ep = "combine" if backward else "dispatch"
+            second_ep = "dispatch" if backward else "combine"
+            for node in (pre, first_launch, first_wait):
+                node.meta["custom"] = {_MODULE_FQN: "layers.0.moe", "EP": first_ep}
+            compute.meta["custom"] = {_MODULE_FQN: "layers.0.moe"}
+            for node in (second_launch, second_wait):
+                node.meta["custom"] = {_MODULE_FQN: "layers.0.moe", "EP": second_ep}
+            tail.meta["custom"] = {_MODULE_FQN: "layers.0.moe"}
+            for node in (
+                pre,
+                first_launch,
+                first_wait,
+                compute,
+                second_launch,
+                second_wait,
+                tail,
+            ):
+                node.meta["chunk_id"] = chunk_id
+                node.meta["chunked_region_fqn"] = "layers.0.moe"
+                if backward:
+                    node.meta["autograd_backward"] = True
+
+        graph.output(tuple(outputs))
+        return torch.fx.GraphModule(torch.nn.Module(), graph)
+
     def _build_previous_module_live_in_gm(self):
         graph = torch.fx.Graph()
         x = graph.placeholder("x")
@@ -890,12 +945,6 @@ class TestChunkPasses(TestCase):
 
         module.forward = chunked_forward
 
-    def _dsv3_chunk_step(self, module, *inputs):
-        pred = module(*inputs)
-        loss = pred.float().sum()
-        params = [p for p in module.parameters() if p.requires_grad]
-        return [loss, pred] + list(torch.autograd.grad(loss, params))
-
     def _dsv3_layers_step(self, layers, hidden, freqs_cis):
         pred = hidden
         for layer in layers.values():
@@ -1043,8 +1092,9 @@ class TestChunkPasses(TestCase):
                 pipeline_parallel_degree=1,
             ),
             compile=SimpleNamespace(
-                chunk_modules=["layers.*"],
-                chunk_mode="batch",
+                passes=["ep_overlap"],
+                ep_overlap_modules=["layers.*"],
+                ep_overlap_mode="batch",
                 cpu_offload_prefetch_n_layers=1,
                 cpu_offload_defer_n_layers=1,
                 cpu_offload_budget_gb=1.0,
@@ -1067,20 +1117,114 @@ class TestChunkPasses(TestCase):
         ]
         self.assertLess(
             names.index("apply_cpu_offload_pass"),
-            names.index("chunk_batch_pass"),
+            names.index("ep_overlap_pass"),
         )
         self.assertLess(
-            names.index("chunk_batch_pass"),
+            names.index("ep_overlap_pass"),
             names.index("selective_activation_remat_pass"),
         )
 
         x = torch.randn(4, 4)
-        prepare_chunk_trace_inputs(config.compile, (x,), {})
+        labels = torch.ones(4, 4)
+        positions = torch.arange(4).repeat(4, 1)
+        prepare_ep_overlap_trace_inputs(
+            config.compile,
+            (x, labels, torch.tensor(16), {}, {"positions": positions}),
+            {},
+        )
         self.assertTrue(hasattr(x, "_torchtitan_chunk_dims"))
+        self.assertTrue(hasattr(labels, "_torchtitan_chunk_dims"))
+        self.assertTrue(hasattr(positions, "_torchtitan_chunk_dims"))
 
-        config.compile.chunk_mode = None
-        with self.assertRaisesRegex(ValueError, "chunk_mode must be set"):
-            prepare_chunk_trace_inputs(config.compile, (torch.randn(4, 4),), {})
+        config.compile.ep_overlap_modules = []
+        with self.assertRaisesRegex(ValueError, "ep_overlap_modules must be non-empty"):
+            prepare_ep_overlap_trace_inputs(config.compile, (torch.randn(4, 4),), {})
+
+    def test_moe_ep_annotations_cover_all_to_all_dispatcher(self):
+        from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+
+        annotate_moe_ep_regions()
+
+        self.assertTrue(
+            getattr(
+                AllToAllTokenDispatcher.dispatch,
+                "_torchtitan_annotated_EP_dispatch",
+                False,
+            )
+        )
+        self.assertTrue(
+            getattr(
+                AllToAllTokenDispatcher.combine,
+                "_torchtitan_annotated_EP_combine",
+                False,
+            )
+        )
+
+    def test_ep_overlap_reorders_forward_and_backward_wait_suffixes(self):
+        for backward, first_chunk in ((False, 0), (True, 1)):
+            with self.subTest(backward=backward):
+                gm = self._build_ep_overlap_schedule_gm(backward=backward)
+                _schedule_ep_overlap_regions(
+                    gm,
+                    module_patterns=["layers.*.moe"],
+                    require_all_to_all=True,
+                )
+                nodes = list(gm.graph.nodes)
+                order = {node: idx for idx, node in enumerate(nodes)}
+
+                def named(chunk_id, target, ep=None, wait=False):
+                    matches = [
+                        node
+                        for node in nodes
+                        if node.meta.get("chunk_id") == chunk_id
+                        and node.target == target
+                        and (ep is None or node.meta.get("custom", {}).get("EP") == ep)
+                        and (
+                            not wait
+                            or node.meta.get("custom", {}).get("EP_wait") is True
+                        )
+                    ]
+                    self.assertEqual(len(matches), 1)
+                    return matches[0]
+
+                second_chunk = 1 - first_chunk
+                c10d = torch.ops._c10d_functional
+                first_dispatch_launch = named(
+                    first_chunk,
+                    c10d.all_to_all_single.default,
+                    ep="dispatch",
+                )
+                second_dispatch_launch = named(
+                    second_chunk,
+                    c10d.all_to_all_single.default,
+                    ep="dispatch",
+                )
+                first_dispatch_wait = named(
+                    first_chunk,
+                    torch.ops.aten.relu.default,
+                    ep="dispatch",
+                    wait=True,
+                )
+                first_combine_wait = named(
+                    first_chunk,
+                    torch.ops.aten.relu.default,
+                    ep="combine",
+                    wait=True,
+                )
+                second_combine_wait = named(
+                    second_chunk,
+                    torch.ops.aten.relu.default,
+                    ep="combine",
+                    wait=True,
+                )
+
+                self.assertLess(
+                    order[first_dispatch_launch], order[second_dispatch_launch]
+                )
+                self.assertLess(
+                    order[second_dispatch_launch], order[first_dispatch_wait]
+                )
+                self.assertLess(order[first_combine_wait], order[second_combine_wait])
 
     def test_chunk_batch_backward_cats_activation_grad_and_sums_param_grad(self):
         graph = torch.fx.Graph()
@@ -1168,7 +1312,7 @@ class TestChunkPasses(TestCase):
             0,
         )
 
-    def test_dsv3_debug_chunk_pass_matches_eager_chunking_bitwise(self):
+    def test_dsv3_debug_ep_overlap_pass_matches_eager_chunking_bitwise(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
@@ -1256,18 +1400,13 @@ class TestChunkPasses(TestCase):
                     traced.example_inputs,
                     mode=mode,
                 )
-                if mode == "batch":
-                    chunk_batch_pass(
-                        traced.gm,
-                        module_patterns=patterns,
-                        num_static_inputs=traced.num_static_inputs,
-                    )
-                else:
-                    chunk_seq_pass(
-                        traced.gm,
-                        module_patterns=patterns,
-                        num_static_inputs=traced.num_static_inputs,
-                    )
+                ep_overlap_pass(
+                    traced.gm,
+                    mode=mode,
+                    module_patterns=patterns,
+                    num_static_inputs=traced.num_static_inputs,
+                    require_all_to_all=False,
+                )
                 actual = run_traced_train_step(traced, graph_model.layers, *graph_args)
 
                 self._assert_bitwise_equal_outputs(

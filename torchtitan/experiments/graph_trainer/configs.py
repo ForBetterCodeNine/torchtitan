@@ -90,16 +90,16 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Maximum CPU memory budget (in GB per rank) for offloaded activations.
     Tensors are selected largest-first until the budget is exhausted."""
 
-    chunk_modules: list[str] = field(default_factory=list)
-    """Module FQN patterns to chunk in aot_fx_trace.
+    ep_overlap_modules: list[str] = field(default_factory=lambda: ["layers.*"])
+    """Module FQN patterns to chunk for ``ep_overlap`` in aot_fx_trace.
 
     Patterns are matched by dot-separated module segments. For example,
     ``layers.*`` applies independently to each transformer block, and
     ``layers.*.moe`` applies independently to each MoE submodule.
     """
 
-    chunk_mode: Literal["batch", "seq"] | None = None
-    """Input dimension kind to split for ``chunk_modules``.
+    ep_overlap_mode: Literal["batch", "seq"] = "batch"
+    """Input dimension kind to split for ``ep_overlap_modules``.
 
     v1 only supports sequence-independent regions. Attention-containing
     regions are rejected unless they are handled by a future full-K/V rewrite.

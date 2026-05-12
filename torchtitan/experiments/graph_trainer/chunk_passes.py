@@ -58,6 +58,9 @@ import torch
 # Register upstream custom ops used by CPU activation offloading.
 import torch._functorch._activation_offloading.offload_ops  # noqa: F401
 import torch.fx as fx
+from torch._dynamo.graph_deduplication import _stable_topological_sort
+from torch.utils._ordered_set import OrderedSet
+from torch.utils._pytree import tree_leaves
 from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.graph_trainer.common_utils import (
@@ -264,6 +267,10 @@ def _forward_closure_from_sources(
         stack.extend(user for user in node.users if user in search_space)
 
     return closure
+
+
+def _is_symbolic_shape_scalar(node: fx.Node) -> bool:
+    return _tensor_meta(node) is None and bool(_free_symbols(node.meta.get("val")))
 
 
 def _find_regions(gm: fx.GraphModule, patterns: list[str]) -> list[_Region]:
@@ -753,33 +760,49 @@ def mark_chunk_dynamic_dims(
     setattr(tensor, _CHUNK_DIMS_ATTR, dims)
 
 
-def prepare_chunk_trace_inputs(
+def prepare_ep_overlap_trace_inputs(
     compile_config: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> None:
-    """Apply chunk-pass input annotations before make_fx tracing.
+    """Apply EP-overlap input annotations before make_fx tracing.
 
     ``trace_train_step`` calls this hook immediately before tracing so
-    chunk-specific trace preparation stays in this module. The graph pass needs
-    these annotations before tracing because make_fx must see a symbolic
-    batch/sequence dimension.
+    overlap-specific trace preparation stays close to the internal chunking
+    implementation. The graph pass needs these annotations before tracing
+    because make_fx must see a symbolic batch/sequence dimension.
     """
-    if not compile_config.chunk_modules:
-        if compile_config.chunk_mode is not None:
-            raise ValueError(
-                "--compile.chunk_modules must be non-empty when "
-                "--compile.chunk_mode is set"
-            )
+    if "ep_overlap" not in getattr(compile_config, "passes", []):
         return
-    if compile_config.chunk_mode is None:
+    if not compile_config.ep_overlap_modules:
         raise ValueError(
-            "--compile.chunk_mode must be set when "
-            "--compile.chunk_modules is non-empty"
+            "--compile.ep_overlap_modules must be non-empty when "
+            "--compile.passes contains ep_overlap"
         )
     if not args or not isinstance(args[0], torch.Tensor):
-        raise ValueError("chunk tracing expects the first user input to be a Tensor")
-    mark_chunk_dynamic_dims(args[0], mode=compile_config.chunk_mode)
+        raise ValueError(
+            "ep_overlap tracing expects the first user input to be a Tensor"
+        )
+    mode = compile_config.ep_overlap_mode
+    if mode == "batch":
+        dim = 0
+    elif mode == "seq":
+        dim = 1
+    else:
+        raise ValueError(f"Unknown ep_overlap_mode: {mode!r}")
+    main_input = args[0]
+    hint = int(main_input.shape[dim])
+
+    def mark_if_matching(value: object) -> None:
+        if (
+            isinstance(value, torch.Tensor)
+            and value.dim() > dim
+            and int(value.shape[dim]) == hint
+        ):
+            mark_chunk_dynamic_dims(value, mode=mode)
+
+    for value in [*tree_leaves(args), *tree_leaves(kwargs)]:
+        mark_if_matching(value)
 
 
 def _is_chunkable_live_in(
@@ -811,6 +834,10 @@ def _copy_meta(src: fx.Node, dst: fx.Node, *, chunk_id: int | None = None) -> No
         dst.meta["custom"] = dict(dst.meta["custom"])
     if chunk_id is not None:
         dst.meta["chunk_id"] = chunk_id
+
+
+def _rename(node: fx.Node, candidate: str) -> None:
+    node._rename(candidate)
 
 
 def _set_recompute_like(src: fx.Node, dst: fx.Node) -> None:
@@ -1034,7 +1061,7 @@ def _scalar_matches_split_dim(
     mode: ChunkMode,
     split_live_ins: dict[fx.Node, tuple[fx.Node, fx.Node]],
 ) -> bool:
-    for live_in, chunks in split_live_ins.items():
+    for live_in in split_live_ins:
         val = _tensor_meta(live_in)
         if val is None:
             continue
@@ -1058,11 +1085,26 @@ def _scalar_sum_matches(
         return False
 
 
+def _scalar_halves_match_guarded_even_original(
+    chunk0_val: object, chunk1_val: object, original_val: object
+) -> bool:
+    try:
+        half_original = _expr(original_val) // 2
+        return _expr_matches(chunk0_val, half_original) and _expr_matches(
+            chunk1_val, half_original
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _materialize_scalar_live_out(
     gm: fx.GraphModule,
     live_out: fx.Node,
     copied0: fx.Node,
     copied1: fx.Node,
+    *,
+    mode: ChunkMode,
+    split_live_ins: dict[fx.Node, tuple[fx.Node, fx.Node]],
 ) -> fx.Node:
     original_val = live_out.meta.get("val")
     chunk0_val = copied0.meta.get("val")
@@ -1075,7 +1117,26 @@ def _materialize_scalar_live_out(
 
     if _scalar_sum_matches(chunk0_val, chunk1_val, original_val):
         materialized = gm.graph.call_function(operator.add, args=(copied0, copied1))
-        materialized.name = f"{live_out.name}_chunk_sum"
+        _rename(materialized, f"{live_out.name}_chunk_sum")
+        materialized.meta["val"] = original_val
+        return materialized
+
+    if _scalar_halves_match_guarded_even_original(
+        chunk0_val, chunk1_val, original_val
+    ) or (
+        _expr_matches(chunk0_val, chunk1_val)
+        and _scalar_matches_split_dim(
+            original_val,
+            mode=mode,
+            split_live_ins=split_live_ins,
+        )
+    ):
+        # Step 9.3: split insertion asserted the symbolic dimension is even.
+        # Under that guard, two copied sym_size halves reconstruct the original
+        # full symbolic size even when general SymPy simplification cannot
+        # prove floor(u0 / 2) + floor(u0 / 2) == u0 for an unconstrained symbol.
+        materialized = gm.graph.call_function(operator.add, args=(copied0, copied1))
+        _rename(materialized, f"{live_out.name}_chunk_sum")
         materialized.meta["val"] = original_val
         return materialized
 
@@ -1183,8 +1244,6 @@ def _make_region_plan(
             f"activation-dependent nodes for chunk_{mode}."
         )
 
-    chunkable_live_ins -= region_nodes
-    provenance_live_ins -= region_nodes
     region_nodes_tuple = tuple(sorted(region_nodes, key=order.__getitem__))
     region_live_ins = {
         inp
@@ -1192,6 +1251,8 @@ def _make_region_plan(
         for inp in node.all_input_nodes
         if inp not in region_nodes
     }
+    chunkable_live_ins = (chunkable_live_ins & region_live_ins) - region_nodes
+    provenance_live_ins = (provenance_live_ins & region_live_ins) - region_nodes
     live_outs = [
         node
         for node in region_nodes_tuple
@@ -1268,6 +1329,12 @@ def _validate_disjoint_plans(plans: list[_RegionPlan]) -> None:
         for node in plan.region_nodes:
             previous = owner.get(node)
             if previous is not None:
+                if _is_symbolic_shape_scalar(node):
+                    # Step 3.2: symbolic shape helpers such as sym_size nodes can
+                    # be shared by adjacent module regions. They are pure shape
+                    # compute, and each region copy rewrites them against that
+                    # region's chunked live-ins.
+                    continue
                 raise ValueError(
                     "Chunk pass planned overlapping regions for node "
                     f"{node.name}: {previous.region.root_fqn!r} "
@@ -1501,8 +1568,9 @@ def _transform_region(
                         chunk_id=chunk_id,
                     ),
                 )
-            new_node.name = f"{node.name}_chunk{chunk_id}"
+            _rename(new_node, f"{node.name}_chunk{chunk_id}")
             _copy_meta(node, new_node, chunk_id=chunk_id)
+            new_node.meta["chunked_region_fqn"] = region.root_fqn
             _infer_node_val(new_node)
             chunked_val = _chunked_meta_from_original(
                 node,
@@ -1544,7 +1612,7 @@ def _transform_region(
                         (copied_by_chunk[0][live_out], copied_by_chunk[1][live_out]),
                     ),
                 )
-                chunk_tuple.name = f"{live_out.name}_chunk_tuple"
+                _rename(chunk_tuple, f"{live_out.name}_chunk_tuple")
                 getitem0 = gm.graph.call_function(
                     operator.getitem, args=(chunk_tuple, 0)
                 )
@@ -1573,6 +1641,8 @@ def _transform_region(
                     live_out,
                     copied_by_chunk[0][live_out],
                     copied_by_chunk[1][live_out],
+                    mode=mode,
+                    split_live_ins=split_live_ins,
                 )
                 num_scalar_materializations += 1
             else:
@@ -1598,7 +1668,7 @@ def _transform_region(
                             copied_by_chunk[1][live_out],
                         ),
                     )
-                    materialized.name = f"{live_out.name}_chunk_sum"
+                    _rename(materialized, f"{live_out.name}_chunk_sum")
                     num_adds += 1
                 else:
                     materialized = gm.graph.call_function(
@@ -1611,7 +1681,7 @@ def _transform_region(
                             dim,
                         ),
                     )
-                    materialized.name = f"{live_out.name}_chunk_cat"
+                    _rename(materialized, f"{live_out.name}_chunk_cat")
                     assert dim is not None
                     materialized.meta["chunk_dim"] = dim
                     num_cats += 1
@@ -1776,3 +1846,219 @@ def chunk_seq_pass(
         num_static_inputs=num_static_inputs,
         module_bucket_plans=module_bucket_plans,
     )
+
+
+def _custom_meta(node: fx.Node) -> dict[str, Any]:
+    custom = node.meta.get("custom")
+    return custom if isinstance(custom, dict) else {}
+
+
+def _ep_region(node: fx.Node) -> str | None:
+    ep = _custom_meta(node).get("EP")
+    return ep if ep in ("dispatch", "combine") else None
+
+
+def _is_all_to_all_node(node: fx.Node) -> bool:
+    return node.op == "call_function" and "all_to_all_single" in str(node.target)
+
+
+def _find_last_all_to_all(nodes: list[fx.Node], order: dict[fx.Node, int]) -> fx.Node:
+    all_to_all_nodes = [node for node in nodes if _is_all_to_all_node(node)]
+    if not all_to_all_nodes:
+        raise ValueError(
+            "ep_overlap expected an all_to_all_single node in EP region nodes: "
+            f"{[node.name for node in nodes]}"
+        )
+    return max(all_to_all_nodes, key=order.__getitem__)
+
+
+def _phase_nodes(
+    chunk_nodes: list[fx.Node],
+    *,
+    is_backward: bool,
+    order: dict[fx.Node, int],
+) -> tuple[list[fx.Node], list[fx.Node], list[fx.Node]] | None:
+    dispatch_nodes = [node for node in chunk_nodes if _ep_region(node) == "dispatch"]
+    combine_nodes = [node for node in chunk_nodes if _ep_region(node) == "combine"]
+    if not dispatch_nodes and not combine_nodes:
+        return None
+    if not dispatch_nodes or not combine_nodes:
+        raise ValueError(
+            "ep_overlap requires both EP dispatch and combine regions in each "
+            f"chunk, found dispatch={bool(dispatch_nodes)} combine={bool(combine_nodes)}"
+        )
+
+    last_dispatch = _find_last_all_to_all(dispatch_nodes, order)
+    last_combine = _find_last_all_to_all(combine_nodes, order)
+    first_launch, second_launch = (
+        (last_combine, last_dispatch) if is_backward else (last_dispatch, last_combine)
+    )
+    first_idx = order[first_launch]
+    second_idx = order[second_launch]
+    if first_idx >= second_idx:
+        expected = "combine-to-dispatch" if is_backward else "dispatch-to-combine"
+        raise ValueError(
+            f"ep_overlap expected {expected} all-to-all order, got "
+            f"{first_launch.name} after {second_launch.name}"
+        )
+
+    for ep_nodes, last_launch in (
+        (dispatch_nodes, last_dispatch),
+        (combine_nodes, last_combine),
+    ):
+        last_idx = order[last_launch]
+        for node in ep_nodes:
+            if order[node] > last_idx:
+                custom = dict(_custom_meta(node))
+                custom["EP_wait"] = True
+                node.meta["custom"] = custom
+
+    return (
+        [node for node in chunk_nodes if order[node] <= first_idx],
+        [node for node in chunk_nodes if first_idx < order[node] <= second_idx],
+        [node for node in chunk_nodes if order[node] > second_idx],
+    )
+
+
+def _add_phase_deps(
+    deps: dict[fx.Node, OrderedSet[fx.Node]],
+    before: list[fx.Node],
+    after: list[fx.Node],
+) -> None:
+    for node in after:
+        node_deps = deps.setdefault(node, OrderedSet())
+        for dep in before:
+            if dep is not node:
+                node_deps.add(dep)
+
+
+def _schedule_ep_overlap_regions(
+    gm: fx.GraphModule,
+    *,
+    module_patterns: list[str],
+    require_all_to_all: bool,
+) -> int:
+    """Order chunked regions so EP all-to-all launches precede peer waits.
+
+    Each chunk is split into three scheduling phases:
+    1. compute through the first EP all-to-all launch,
+    2. first wait suffix, expert compute, and second EP all-to-all launch,
+    3. second wait suffix and post-EP tail.
+
+    Forward regions use dispatch then combine. Backward autograd sees combine
+    gradients before dispatch gradients, so it uses combine then dispatch and
+    reverses the chunk order. Non-MoE transformer blocks have no EP phases and
+    are left in the chunk pass's original topological order.
+    """
+    order = _ordered_nodes(gm)
+    grouped: dict[tuple[str, bool], dict[int, list[fx.Node]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+
+    for node in gm.graph.nodes:
+        chunk_id = node.meta.get("chunk_id")
+        if chunk_id not in (0, 1):
+            continue
+        root = node.meta.get("chunked_region_fqn")
+        if not isinstance(root, str) or not root:
+            fqn = _fqn(node)
+            roots = [match for p in module_patterns if (match := _pattern_root(p, fqn))]
+            root = roots[0] if len(roots) == 1 else ""
+        if not root:
+            continue
+        grouped[(root, _is_backward_node(node))][chunk_id].append(node)
+
+    deps: dict[fx.Node, OrderedSet[fx.Node]] = {}
+    scheduled = 0
+    for (root, is_backward), by_chunk in sorted(
+        grouped.items(),
+        key=lambda item: min(order[n] for nodes in item[1].values() for n in nodes),
+    ):
+        if set(by_chunk) != {0, 1}:
+            raise ValueError(
+                f"ep_overlap expected both chunk 0 and chunk 1 for region {root!r} "
+                f"({'backward' if is_backward else 'forward'}), found {sorted(by_chunk)}"
+            )
+
+        chunk_order = (1, 0) if is_backward else (0, 1)
+        phases_by_chunk = {
+            chunk_id: _phase_nodes(
+                sorted(by_chunk[chunk_id], key=order.__getitem__),
+                is_backward=is_backward,
+                order=order,
+            )
+            for chunk_id in chunk_order
+        }
+        missing_phases = [
+            chunk_id for chunk_id, phases in phases_by_chunk.items() if phases is None
+        ]
+        if missing_phases:
+            if len(missing_phases) == len(phases_by_chunk):
+                continue
+            raise ValueError(
+                f"ep_overlap found EP all-to-all regions for only one chunk of "
+                f"{root!r} ({'backward' if is_backward else 'forward'}): "
+                f"missing chunks {missing_phases}."
+            )
+
+        assert phases_by_chunk[chunk_order[0]] is not None
+        assert phases_by_chunk[chunk_order[1]] is not None
+        first = phases_by_chunk[chunk_order[0]]
+        second = phases_by_chunk[chunk_order[1]]
+        assert first is not None and second is not None
+        ordered_phases = [
+            first[0],
+            second[0],
+            first[1],
+            second[1],
+            first[2],
+            second[2],
+        ]
+        non_empty_phases = [phase for phase in ordered_phases if phase]
+        for earlier, later in zip(non_empty_phases, non_empty_phases[1:]):
+            _add_phase_deps(deps, earlier, later)
+        scheduled += 1
+
+    if scheduled:
+        _stable_topological_sort(gm.graph, deps)
+        gm.graph.lint()
+        gm.recompile()
+    elif require_all_to_all:
+        raise ValueError(
+            f"ep_overlap did not find any chunked EP all-to-all regions for "
+            f"patterns {module_patterns}."
+        )
+    return scheduled
+
+
+def ep_overlap_pass(
+    gm: fx.GraphModule,
+    example_inputs: tuple[Any, ...] | None = None,
+    *,
+    mode: ChunkMode,
+    module_patterns: list[str],
+    num_static_inputs: int = 0,
+    module_bucket_plans: list[list[str] | str] | None = None,
+    require_all_to_all: bool = True,
+) -> fx.GraphModule:
+    """Chunk selected regions and reorder chunk streams around EP all-to-alls."""
+    gm = apply_chunk_pass(
+        gm,
+        example_inputs,
+        mode=mode,
+        module_patterns=module_patterns,
+        num_static_inputs=num_static_inputs,
+        module_bucket_plans=module_bucket_plans,
+    )
+    scheduled = _schedule_ep_overlap_regions(
+        gm,
+        module_patterns=module_patterns,
+        require_all_to_all=require_all_to_all,
+    )
+    logger.info(
+        "Applied ep_overlap to %d chunked region(s): mode=%s modules=%s",
+        scheduled,
+        mode,
+        module_patterns,
+    )
+    return gm
