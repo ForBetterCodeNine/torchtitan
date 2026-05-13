@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torch.distributed.tensor import Placement, Replicate, Shard
+from torch.distributed.tensor import Partial, Placement, Replicate, Shard
 
 from torchtitan.models.common.attention import FusedQKVLinear, GQAttention, QKVLinear
 from torchtitan.protocols.sharding import LocalMapConfig, NamedPlacement, ShardingConfig
@@ -158,17 +158,53 @@ def set_gqa_inner_attention_local_map(
     TP-sharded (``Shard(2)``), regardless of SP. ``local_map`` converts them
     to local tensors before the kernel runs, then wraps outputs back.
 
+    Declares placements over the full dense SPMD axis set (DP/CP/TP) so
+    the LocalMap composes under ``full_dtensor`` (where the surrounding
+    mesh is multi-axis); under non-full_dtensor, the (tp,)-only mesh only
+    consumes the ``TP`` placement and the rest are ignored.
+
+    Under ``full_dtensor`` + CP, q stays seq-sharded on the CP axis
+    (``Shard(1)``) while k/v are ``Replicate`` on CP -- DTensor all-gathers
+    k/v at the local_map boundary so the kernel sees full-length keys
+    (matching the BlockMask's kv dimension). Q's local grad is naturally
+    seq-sharded; k/v's local grads accumulate as ``Partial`` on CP and
+    DTensor reduces them on the way out.
+
     ``return_lse=True`` is for kernels that return ``(output, lse)`` (e.g.,
     GPT-OSS's flash attention with ``return_lse=True``); both outputs share
     the same heads-sharded placement.
     """
-    qkv_placements: NamedPlacement = {TP: Shard(2)}
-    num_outputs = 2 if return_lse else 1
+    import inspect
+
+    q_placements: NamedPlacement = dense_activation_placement(tp=Shard(2))
+    kv_placements: NamedPlacement = dense_activation_placement(
+        tp=Shard(2), cp=Replicate()
+    )
+    kv_grad_placements: NamedPlacement = dense_activation_placement(
+        tp=Shard(2), cp=Partial()
+    )
+    # Inner-attention forward signature varies by backend (q/k/v vs xq/xk/xv);
+    # bind in_dst_shardings by the actual arg names.
+    build_class = inner_attention_cfg._owner
+    q_name, k_name, v_name = [
+        p.name
+        for p in inspect.signature(build_class.forward).parameters.values()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        and p.name != "self"
+    ][:3]
+    out_src: NamedPlacement | tuple[NamedPlacement, ...] = (
+        (q_placements, q_placements) if return_lse else q_placements
+    )
     inner_attention_cfg.sharding_config = ShardingConfig(
+        in_dst_shardings={
+            q_name: q_placements,
+            k_name: kv_placements,
+            v_name: kv_placements,
+        },
+        out_src_shardings=out_src,
         local_map=LocalMapConfig(
-            in_placements=(qkv_placements, qkv_placements, qkv_placements),
-            out_placements=(qkv_placements,) * num_outputs,
-            in_grad_placements=(qkv_placements, qkv_placements, qkv_placements),
+            in_grad_placements=(q_placements, kv_grad_placements, kv_grad_placements),
         ),
     )
 
