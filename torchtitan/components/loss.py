@@ -349,6 +349,7 @@ class ChunkedCELoss(BaseLoss):
         self._maybe_compile(compile_config)
         self.num_chunks = config.num_chunks
         self.lm_head: nn.Module | None = None
+        self.enable_sp: bool = False
         self.loss_parallel: bool = False
 
     def set_lm_head(self, lm_head: nn.Module) -> None:
@@ -393,6 +394,17 @@ class ChunkedCELoss(BaseLoss):
         )
 
         total_loss = h_detached.new_zeros((), dtype=torch.float32)
+        if spmd.is_type_checking():
+            for axis in spmd_state().dp_axes:
+                total_loss = spmd.reinterpret(
+                    total_loss, axis, src=spmd.R, dst=spmd.P, expert_mode=True
+                )
+            if (tp_ax := mesh().tp) is not None:
+                tp_pg = spmd_state().pg_for_axis(tp_ax)
+                assert tp_pg is not None
+                total_loss = spmd.convert(
+                    total_loss, tp_pg, src=spmd.R, dst=spmd.I, expert_mode=True
+                )
 
         # Disable FSDP reshard on lm_head to keep weight unsharded across
         # all chunks, avoiding repeated all-gathers. Coalesce per-chunk
@@ -417,13 +429,14 @@ class ChunkedCELoss(BaseLoss):
                 chunk_loss = self.fn(logits, label_chunk)
             if global_valid_tokens is not None:
                 chunk_loss = chunk_loss / global_valid_tokens
-            total_loss = total_loss + chunk_loss.detach()
 
             if spmd.is_type_checking():
                 for axis in spmd_state().dp_axes:
                     chunk_loss = spmd.reinterpret(
                         chunk_loss, axis, src=spmd.V, dst=spmd.P, expert_mode=True
                     )
+
+            total_loss = total_loss + chunk_loss.detach()
 
             if requires_grad:
                 with spmd.no_typecheck():
@@ -501,8 +514,8 @@ class ChunkedCELoss(BaseLoss):
                         dt_mesh, tuple(placements)
                     )
 
-        # SPMD path: all-gather S(1)@tp -> R@tp before the local_map boundary.
-        if is_spmd_active() and not self.loss_parallel:
+        # SPMD path: all-gather S(1)@tp -> R@tp before chunking.
+        if is_spmd_active() and self.enable_sp:
             tp_ax = mesh().tp
             if tp_ax is not None:
                 bwd = (
